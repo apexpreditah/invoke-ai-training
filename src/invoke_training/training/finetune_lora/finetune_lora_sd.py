@@ -42,7 +42,34 @@ from invoke_training.training.shared.data.transforms.tensor_disk_cache import (
     TensorDiskCache,
 )
 from invoke_training.training.shared.lora_checkpoint_utils import save_lora_checkpoint
+from invoke_training.training.shared.model_loading_utils import (
+    PipelineVersionEnum,
+    load_pipeline,
+)
 from invoke_training.training.shared.optimizer_utils import initialize_optimizer
+
+
+def apply_snr_weight(loss, timesteps, noise_scheduler, gamma):
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    gamma_over_snr = torch.div(torch.ones_like(snr) * gamma, snr)
+    snr_weight = torch.minimum(gamma_over_snr, torch.ones_like(gamma_over_snr)).float().to(loss.device)  # from paper
+    loss = loss * snr_weight
+    return loss
+
+
+# TODO(ryand): Is the device param needed??
+def prepare_scheduler_for_custom_training(noise_scheduler):
+    if hasattr(noise_scheduler, "all_snr"):
+        return
+
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+    alpha = sqrt_alphas_cumprod
+    sigma = sqrt_one_minus_alphas_cumprod
+    all_snr = (alpha / sigma) ** 2
+
+    noise_scheduler.all_snr = all_snr  # .to(device)
 
 
 def load_models(
@@ -64,11 +91,18 @@ def load_models(
             UNet2DConditionModel,
         ]: A tuple of loaded models.
     """
-    tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(config.model, subfolder="tokenizer")
-    noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(config.model, subfolder="scheduler")
-    text_encoder: CLIPTextModel = CLIPTextModel.from_pretrained(config.model, subfolder="text_encoder")
-    vae: AutoencoderKL = AutoencoderKL.from_pretrained(config.model, subfolder="vae")
-    unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(config.model, subfolder="unet")
+    pipeline: StableDiffusionPipeline = load_pipeline(config.model, PipelineVersionEnum.SD)
+
+    # Extract sub-models from the pipeline.
+    tokenizer: CLIPTokenizer = pipeline.tokenizer
+    text_encoder: CLIPTextModel = pipeline.text_encoder
+    vae: AutoencoderKL = pipeline.vae
+    unet: UNet2DConditionModel = pipeline.unet
+
+    noise_scheduler = DDPMScheduler(
+        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
+    )
+    prepare_scheduler_for_custom_training(noise_scheduler)
 
     # Disable gradient calculation for model weights to save memory.
     text_encoder.requires_grad_(False)
@@ -300,11 +334,18 @@ def train_forward(
     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
     loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
+
+    # Mean-reduce the loss along all dimensions except for the batch dimension.
+    loss = loss.mean([1, 2, 3])
+
     if "loss_weight" in data_batch:
-        # Mean-reduce the loss along all dimensions except for the batch dimension.
-        loss = loss.mean([1, 2, 3])
         # Apply per-example weights.
         loss = loss * data_batch["loss_weight"]
+
+    loss = apply_snr_weight(
+        loss, timesteps, noise_scheduler, gamma=5
+    )  # TODO(ryand): Don't forget to parameterize gamma.
+
     return loss.mean()
 
 

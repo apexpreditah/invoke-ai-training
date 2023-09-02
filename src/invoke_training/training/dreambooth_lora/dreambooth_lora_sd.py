@@ -25,10 +25,11 @@ from invoke_training.training.shared.accelerator_utils import (
     initialize_accelerator,
     initialize_logging,
 )
-from invoke_training.training.shared.base_model_version import (
-    BaseModelVersionEnum,
-    check_base_model_version,
-)
+
+# from invoke_training.training.shared.base_model_version import (
+#     BaseModelVersionEnum,
+#     check_base_model_version,
+# )
 from invoke_training.training.shared.checkpoint_tracker import CheckpointTracker
 from invoke_training.training.shared.data.data_loaders.dreambooth_sd_dataloader import (
     build_dreambooth_sd_dataloader,
@@ -39,11 +40,11 @@ from invoke_training.training.shared.optimizer_utils import initialize_optimizer
 
 def run_training(config: DreamBoothLoRAConfig):  # noqa: C901
     # Give a clear error message if an unsupported base model was chosen.
-    check_base_model_version(
-        {BaseModelVersionEnum.STABLE_DIFFUSION_V1, BaseModelVersionEnum.STABLE_DIFFUSION_V2},
-        config.model,
-        local_files_only=False,
-    )
+    # check_base_model_version(
+    #     {BaseModelVersionEnum.STABLE_DIFFUSION_V1, BaseModelVersionEnum.STABLE_DIFFUSION_V2},
+    #     config.model,
+    #     local_files_only=False,
+    # )
 
     # Create a timestamped directory for all outputs.
     out_dir = os.path.join(config.output.base_output_dir, f"{time.time()}")
@@ -131,7 +132,18 @@ def run_training(config: DreamBoothLoRAConfig):  # noqa: C901
             # would have 0 gradients, and so would not get trained.
             text_encoder.text_model.embeddings.requires_grad_(True)
 
-    optimizer = initialize_optimizer(config.optimizer, lora_layers.parameters())
+    all_params = [
+        {
+            "params": lora_layers["unet"].parameters(),
+            "lr": 0.0001,
+        },
+        {
+            "params": lora_layers["text_encoder"].parameters(),
+            "lr": 5e-5,
+        },
+    ]
+
+    optimizer = initialize_optimizer(config.optimizer, all_params)
 
     data_loader = build_dreambooth_sd_dataloader(
         data_loader_config=config.dataset,
